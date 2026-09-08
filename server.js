@@ -103,6 +103,8 @@ app.post('/webhook/vendor-payment', async (req, res) => {
       req.query.paymentId ||
       req.body?.payment_id ||
       req.body?.vendor_payment?.payment_id ||
+      req.body?.vendor_payment?.vendor_payment_id ||
+      req.body?.vendor_payment?.payment_number ||
       null;
 
     // Discard placeholder strings (e.g. ${VENDOR_PAYMENT.PAYMENT_ID})
