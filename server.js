@@ -335,12 +335,17 @@ app.post('/webhook/vendor-payment', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`
 🚀 ========================================================
    Zoho Books Auto-Adjusting Journal Service is LIVE!
    Port:    ${PORT}
    URL:     http://localhost:${PORT}
    Webhook: http://localhost:${PORT}/webhook/vendor-payment
 ========================================================`);
-});
+  });
+}
+
+module.exports = app;
+
