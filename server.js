@@ -8,8 +8,8 @@ app.use(express.urlencoded({ extended: true }));
 
 let cachedAccessToken = null;
 let tokenExpiresAt = 0;
-let cachedAccounts = null;
-let accountsCachedAt = 0;
+// Per-organization account cache (keyed by orgId)
+const cachedAccountsMap = new Map();   // orgId → { accounts, cachedAt }
 
 // ── 1. OAuth Access Token Manager ─────────────────────────────────────────────
 async function getAccessToken() {
@@ -38,46 +38,50 @@ async function getAccessToken() {
 }
 
 // ── 2. Chart of Accounts Dynamic Resolver ──────────────────────────────────────
-async function getAccountId(accountName, token) {
-  const orgId = process.env.ZOHO_ORG_ID;
+// orgId is now passed in so each organization gets its own isolated account cache
+async function getAccountId(accountName, token, orgId) {
   const booksApiUrl = process.env.ZOHO_BOOKS_API_URL || 'https://www.zohoapis.com/books/v3';
   const now = Date.now();
 
-  // Cache accounts for 10 minutes
-  if (!cachedAccounts || now - accountsCachedAt > 10 * 60 * 1000) {
+  // Per-org cache — retrieve or initialise
+  let orgCache = cachedAccountsMap.get(orgId) || { accounts: null, cachedAt: 0 };
+
+  // Refresh cache if missing or older than 10 minutes
+  if (!orgCache.accounts || now - orgCache.cachedAt > 10 * 60 * 1000) {
     try {
       const res = await axios.get(`${booksApiUrl}/chartofaccounts?organization_id=${orgId}`, {
         headers: { Authorization: `Zoho-oauthtoken ${token}` },
       });
-      cachedAccounts = res.data.chartofaccounts || [];
-      accountsCachedAt = now;
-      console.log(`📚 Chart of Accounts loaded (${cachedAccounts.length} accounts).`);
+      orgCache = { accounts: res.data.chartofaccounts || [], cachedAt: now };
+      cachedAccountsMap.set(orgId, orgCache);
+      console.log(`📚 [Org: ${orgId}] Chart of Accounts loaded (${orgCache.accounts.length} accounts).`);
     } catch (err) {
-      console.error('⚠️ Could not refresh Chart of Accounts:', err.message);
-      if (!cachedAccounts) throw err;
+      console.error(`⚠️ [Org: ${orgId}] Could not refresh Chart of Accounts:`, err.message);
+      if (!orgCache.accounts) throw err;
     }
   }
 
+  const accounts = orgCache.accounts;
   const cleanName = (accountName || '').trim().toLowerCase();
   if (!cleanName) return null;
 
   // 1. Exact match
-  let match = cachedAccounts.find((a) => a.account_name.trim().toLowerCase() === cleanName);
+  let match = accounts.find((a) => a.account_name.trim().toLowerCase() === cleanName);
 
   // 2. Partial match (contains)
   if (!match) {
-    match = cachedAccounts.find((a) => a.account_name.toLowerCase().includes(cleanName));
+    match = accounts.find((a) => a.account_name.toLowerCase().includes(cleanName));
   }
 
   // 3. Reverse partial match
   if (!match) {
-    match = cachedAccounts.find((a) => cleanName.includes(a.account_name.toLowerCase()));
+    match = accounts.find((a) => cleanName.includes(a.account_name.toLowerCase()));
   }
 
   // 4. Token-based word match (e.g. "Student Refundable Deposits" matching "Refundable Deposits")
   if (!match) {
     const words = cleanName.split(/\s+/).filter((w) => w.length > 3);
-    match = cachedAccounts.find((a) => {
+    match = accounts.find((a) => {
       const aName = a.account_name.toLowerCase();
       return words.some((w) => aName.includes(w));
     });
@@ -97,6 +101,71 @@ app.get('/', (req, res) =>
 
 app.get('/webhook/vendor-payment', (req, res) => res.json({ status: 'OK' }));
 
+// ── Status / Health Dashboard ──────────────────────────────────────────────────
+app.get('/status', async (req, res) => {
+  const booksApiUrl = process.env.ZOHO_BOOKS_API_URL || 'https://www.zohoapis.com/books/v3';
+
+  // Known organizations (from env + well-known IDs)
+  const knownOrgs = [
+    { id: '933829154',  name: 'Wycherley International School (Main)' },
+    { id: '935314774',  name: 'Wycherley - Dehiwala' },
+    { id: '935314758',  name: 'Wycherley - Gampaha' },
+    { id: '935315548',  name: 'Wycherley - Panadura' },
+  ];
+
+  // Also include env org if not already listed
+  const envOrg = process.env.ZOHO_ORG_ID;
+  if (envOrg && !knownOrgs.find((o) => o.id === envOrg)) {
+    knownOrgs.unshift({ id: envOrg, name: 'From .env (ZOHO_ORG_ID)' });
+  }
+
+  let tokenStatus = 'unknown';
+  let accessToken = null;
+
+  // 1. Test OAuth token
+  try {
+    accessToken = await getAccessToken();
+    tokenStatus = '✅ Connected';
+  } catch (e) {
+    tokenStatus = `❌ Failed: ${e.message}`;
+  }
+
+  // 2. Test each organization
+  const orgResults = [];
+  for (const org of knownOrgs) {
+    if (!accessToken) {
+      orgResults.push({ ...org, status: '❌ Skipped (no token)', accounts: null });
+      continue;
+    }
+    try {
+      const res = await axios.get(`${booksApiUrl}/chartofaccounts?organization_id=${org.id}&per_page=1`, {
+        headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
+        timeout: 8000,
+      });
+      const count = res.data?.chartofaccounts?.length ?? 0;
+      const cached = cachedAccountsMap.has(org.id);
+      orgResults.push({
+        ...org,
+        api_access: '✅ API Connected (OAuth token works)',
+        automation_note: '⚠️ Webhook + Workflow Rule must be set up inside this org in Zoho Books for auto journal to work',
+        accounts_sample: count,
+        cache: cached ? '🟢 Cached' : '⚪ Not cached yet',
+      });
+    } catch (e) {
+      const errMsg = e.response?.data?.message || e.message;
+      orgResults.push({ ...org, status: `❌ Error: ${errMsg}`, accounts_sample: null });
+    }
+  }
+
+  return res.json({
+    service: 'Zoho Books Auto-Adjusting Journal Service',
+    oauth_token: tokenStatus,
+    organizations: orgResults,
+    cache_summary: `${cachedAccountsMap.size} org(s) cached`,
+    checked_at: new Date().toLocaleString('en-LK', { timeZone: 'Asia/Colombo' }),
+  });
+});
+
 // ── 4. Main Webhook Handler ────────────────────────────────────────────────────
 app.post('/webhook/vendor-payment', async (req, res) => {
   const timestamp = new Date().toLocaleTimeString();
@@ -105,7 +174,21 @@ app.post('/webhook/vendor-payment', async (req, res) => {
   console.log('Query:', JSON.stringify(req.query));
   console.log('Body:', JSON.stringify(req.body, null, 2));
 
-  const orgId = process.env.ZOHO_ORG_ID;
+  // ── Auto-detect Organization ID from the incoming webhook ──
+  // Zoho sends organization_id in query params or inside the body payload
+  const orgId =
+    req.query.organization_id ||
+    req.body?.organization_id ||
+    req.body?.vendor_payment?.organization_id ||
+    process.env.ZOHO_ORG_ID; // fallback to .env if not present in request
+
+  console.log(`🏢 Organization ID: ${orgId}`);
+
+  if (!orgId) {
+    console.error('❌ No organization_id found in request or .env');
+    return res.status(400).json({ success: false, error: 'organization_id is required but was not found in the request or environment.' });
+  }
+
   const booksApiUrl = process.env.ZOHO_BOOKS_API_URL || 'https://www.zohoapis.com/books/v3';
 
   try {
@@ -262,7 +345,7 @@ app.post('/webhook/vendor-payment', async (req, res) => {
       });
     }
 
-    const resolvedAccount = await getAccountId(targetAccountName, accessToken);
+    const resolvedAccount = await getAccountId(targetAccountName, accessToken, orgId);
 
     if (!resolvedAccount) {
       console.error(`❌ Could not find account "${targetAccountName}" in Chart of Accounts.`);
